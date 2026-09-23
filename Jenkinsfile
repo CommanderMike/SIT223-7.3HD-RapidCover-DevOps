@@ -59,15 +59,37 @@ pipeline {
                 }
             }
         }
+
+        stage('Code Quality') {
+            steps {
+                echo 'Running SonarQube Cloud code quality analysis...'
+
+                withCredentials([
+                    string(
+                        credentialsId: 'sonarcloud-token',
+                        variable: 'SONAR_TOKEN'
+                    )
+                ]) {
+                    bat '''
+                        call npx @sonar/scan ^
+                        -Dsonar.token=%SONAR_TOKEN%
+                    '''
+                }
+            }
+        }
     }
 
     post {
         success {
-            echo 'RapidCover Build and Test stages completed successfully.'
+            echo 'RapidCover Build, Test and Code Quality stages completed successfully.'
         }
 
         failure {
-            echo 'Pipeline stopped because a Build or Test quality gate failed.'
+            echo 'Pipeline stopped because a quality gate or pipeline stage failed.'
+        }
+
+        always {
+            echo "Jenkins Build #${env.BUILD_NUMBER} finished."
         }
     }
 }
