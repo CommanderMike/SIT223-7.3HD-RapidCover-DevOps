@@ -17,9 +17,21 @@ pipeline {
                 echo 'Installing locked project dependencies...'
                 bat 'call npm ci'
 
-                echo 'Creating versioned application package...'
+                script {
+                    env.SHORT_COMMIT = bat(
+                        returnStdout: true,
+                        script: '@git rev-parse --short HEAD'
+                    ).trim()
+
+                    env.ARTIFACT_NAME =
+                        "rapidcover-hd-build-${env.BUILD_NUMBER}-${env.SHORT_COMMIT}.tgz"
+                }
+
+                echo "Creating versioned artifact: ${env.ARTIFACT_NAME}"
+
                 bat 'if exist *.tgz del /Q *.tgz'
                 bat 'call npm pack'
+                bat "ren rapidcover-hd-1.0.0.tgz ${env.ARTIFACT_NAME}"
             }
 
             post {
