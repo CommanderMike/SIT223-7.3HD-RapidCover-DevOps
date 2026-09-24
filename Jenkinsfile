@@ -92,4 +92,17 @@ pipeline {
             echo "Jenkins Build #${env.BUILD_NUMBER} finished."
         }
     }
+        stage('Security') {
+        steps {
+            echo 'Running dependency security audit...'
+
+            bat '''
+                call npm audit --audit-level=high
+                call npm audit --json > npm-audit.json
+            '''
+
+            archiveArtifacts artifacts: 'npm-audit.json',
+                            fingerprint: true
+        }
+    }
 }
