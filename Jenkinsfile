@@ -8,6 +8,9 @@ pipeline {
 
     environment {
         NODE_ENV = 'test'
+
+        // Limit SonarQube scanner memory usage on this machine
+        SONAR_SCANNER_JAVA_OPTS = '-Xms128m -Xmx512m'
     }
 
     stages {
@@ -72,7 +75,8 @@ pipeline {
                 ]) {
                     bat '''
                         call npx @sonar/scan ^
-                        -Dsonar.token=%SONAR_TOKEN%
+                        -Dsonar.token=%SONAR_TOKEN% ^
+                        -Dsonar.javascript.node.maxspace=1024
                     '''
                 }
             }
