@@ -77,11 +77,32 @@ pipeline {
                 }
             }
         }
+
+        stage('Security') {
+            steps {
+                echo 'Running dependency security audit...'
+
+                bat '''
+                    call npm audit --json > npm-audit.json
+                    call npm audit --audit-level=high
+                '''
+            }
+
+            post {
+                always {
+                    archiveArtifacts(
+                        artifacts: 'npm-audit.json',
+                        allowEmptyArchive: true,
+                        fingerprint: true
+                    )
+                }
+            }
+        }
     }
 
     post {
         success {
-            echo 'RapidCover Build, Test and Code Quality stages completed successfully.'
+            echo 'RapidCover Build, Test, Code Quality and Security stages completed successfully.'
         }
 
         failure {
@@ -90,19 +111,6 @@ pipeline {
 
         always {
             echo "Jenkins Build #${env.BUILD_NUMBER} finished."
-        }
-    }
-        stage('Security') {
-        steps {
-            echo 'Running dependency security audit...'
-
-            bat '''
-                call npm audit --audit-level=high
-                call npm audit --json > npm-audit.json
-            '''
-
-            archiveArtifacts artifacts: 'npm-audit.json',
-                            fingerprint: true
         }
     }
 }
