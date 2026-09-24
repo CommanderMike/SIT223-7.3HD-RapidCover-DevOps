@@ -98,11 +98,30 @@ pipeline {
                 }
             }
         }
+
+        stage('Deploy to Staging') {
+            steps {
+                echo 'Deploying RapidCover to temporary staging environment on port 3100...'
+
+                bat '''
+                    powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:PORT='3100'; $env:NODE_ENV='staging'; $p = Start-Process -FilePath 'node' -ArgumentList 'src/server.js' -PassThru -RedirectStandardOutput 'staging-server.log' -RedirectStandardError 'staging-server-error.log'; try { Start-Sleep -Seconds 3; $response = Invoke-RestMethod -Uri 'http://127.0.0.1:3100/health' -Method Get; $response | ConvertTo-Json | Set-Content -Path 'staging-health.json'; if ($response.status -ne 'ok') { throw 'Staging health check did not return status ok.' }; Write-Host 'Staging health check passed.' } finally { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force } }"
+                '''
+            }
+
+            post {
+                always {
+                    archiveArtifacts(
+                        artifacts: 'staging-health.json,staging-server.log,staging-server-error.log',
+                        allowEmptyArchive: true
+                    )
+                }
+            }
+        }
     }
 
     post {
         success {
-            echo 'RapidCover Build, Test, Code Quality and Security stages completed successfully.'
+            echo 'RapidCover Build, Test, Code Quality, Security and Staging stages completed successfully.'
         }
 
         failure {
