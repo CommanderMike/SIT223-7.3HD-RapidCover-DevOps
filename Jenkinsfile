@@ -117,11 +117,53 @@ pipeline {
                 }
             }
         }
+
+        stage('Release to Production') {
+            steps {
+                echo 'Promoting tested RapidCover build to production...'
+
+                script {
+                    env.RELEASE_TAG =
+                        "v1.0.${env.BUILD_NUMBER}"
+
+                    env.RELEASE_ARTIFACT =
+                        "rapidcover-hd-${env.RELEASE_TAG}-${env.SHORT_COMMIT}.tgz"
+                }
+
+                echo "Creating production release ${env.RELEASE_TAG}"
+                echo "Release artifact: ${env.RELEASE_ARTIFACT}"
+
+                bat '''
+                    if not exist production-release mkdir production-release
+
+                    copy /Y "%ARTIFACT_NAME%" ^
+                    "production-release\\%RELEASE_ARTIFACT%"
+
+                    git tag -f "%RELEASE_TAG%" HEAD
+                '''
+
+                echo 'Starting production validation environment on port 3200...'
+
+                bat '''
+                    powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:PORT='3200'; $env:NODE_ENV='production'; $p = Start-Process -FilePath 'node' -ArgumentList 'src/server.js' -PassThru -RedirectStandardOutput 'production-server.log' -RedirectStandardError 'production-server-error.log'; try { Start-Sleep -Seconds 3; $response = Invoke-RestMethod -Uri 'http://127.0.0.1:3200/health' -Method Get; $response | ConvertTo-Json | Set-Content -Path 'production-health.json'; if ($response.status -ne 'ok') { throw 'Production health check did not return status ok.' }; $manifest = [ordered]@{ releaseTag='%RELEASE_TAG%'; buildNumber='%BUILD_NUMBER%'; commit='%SHORT_COMMIT%'; environment='production'; artifact='%RELEASE_ARTIFACT%'; healthStatus=$response.status; releasedAt=(Get-Date).ToString('o') }; $manifest | ConvertTo-Json | Set-Content -Path 'release-manifest.json'; Write-Host 'Production release %RELEASE_TAG% passed health check.' } finally { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force } }"
+                '''
+            }
+
+            post {
+                always {
+                    archiveArtifacts(
+                        artifacts: 'production-release/*.tgz,production-health.json,release-manifest.json,production-server.log,production-server-error.log',
+                        allowEmptyArchive: true,
+                        fingerprint: true
+                    )
+                }
+            }
+        }
     }
 
     post {
         success {
-            echo 'RapidCover Build, Test, Code Quality, Security and Staging stages completed successfully.'
+            echo 'RapidCover Build, Test, Code Quality, Security, Staging and Release stages completed successfully.'
         }
 
         failure {
