@@ -11,6 +11,9 @@ pipeline {
 
         // Limit SonarQube scanner memory usage on this machine
         SONAR_SCANNER_JAVA_OPTS = '-Xms128m -Xmx512m'
+
+        // Monitoring alert destination
+        ALERT_EMAIL = 'mikekaranja000@gmail.com'
     }
 
     stages {
@@ -163,15 +166,65 @@ pipeline {
                 }
             }
         }
+
+        stage('Monitoring & Alerting') {
+            steps {
+                echo 'Monitoring RapidCover production health and system metrics...'
+
+                script {
+
+                    def monitoringResult = bat(
+                        returnStatus: true,
+                        script: '''
+                            powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $env:PORT='3300'; $env:NODE_ENV='production'; $p = Start-Process -FilePath 'node' -ArgumentList 'src/server.js' -PassThru -RedirectStandardOutput 'monitoring-server.log' -RedirectStandardError 'monitoring-server-error.log'; try { Start-Sleep -Seconds 3; $samples = @(); 1..3 | ForEach-Object { $response = Invoke-RestMethod -Uri 'http://127.0.0.1:3300/health' -Method Get; $cpuInfo = Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter \\"Name='_Total'\\"; $osInfo = Get-CimInstance Win32_OperatingSystem; $appProcess = Get-Process -Id $p.Id; $cpu = [double]$cpuInfo.PercentProcessorTime; $freeMemoryMB = [math]::Round($osInfo.FreePhysicalMemory / 1024, 2); $appMemoryMB = [math]::Round($appProcess.WorkingSet64 / 1MB, 2); $samples += [pscustomobject]@{ timestamp=(Get-Date).ToString('o'); health=$response.status; systemCpuPercent=[math]::Round($cpu,2); availableMemoryMB=$freeMemoryMB; appWorkingSetMB=$appMemoryMB }; Write-Host \\"Health=$($response.status), CPU=$([math]::Round($cpu,2))%, AvailableMemory=$freeMemoryMB MB, AppMemory=$appMemoryMB MB\\"; Start-Sleep -Seconds 2 }; $healthAlerts = @($samples | Where-Object { $_.health -ne 'ok' }).Count; $cpuAlerts = @($samples | Where-Object { $_.systemCpuPercent -gt 95 }).Count; $memoryAlerts = @($samples | Where-Object { $_.availableMemoryMB -lt 250 }).Count; if ($healthAlerts -gt 0 -or $cpuAlerts -ge 2 -or $memoryAlerts -ge 2) { $status='ALERT' } else { $status='HEALTHY' }; $report = [ordered]@{ application='RapidCover'; environment='production-monitoring'; buildNumber=$env:BUILD_NUMBER; commit=$env:SHORT_COMMIT; status=$status; alertRules=[ordered]@{ health='status must equal ok'; cpu='more than 95 percent for at least two samples'; availableMemory='below 250 MB for at least two samples' }; samples=$samples; generatedAt=(Get-Date).ToString('o') }; $report | ConvertTo-Json -Depth 6 | Set-Content -Path 'monitoring-report.json'; Write-Host \\"Monitoring result: $status\\"; if ($status -eq 'ALERT') { exit 2 } } finally { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force } }"
+                        '''
+                    )
+
+                    if (monitoringResult != 0) {
+
+                        echo 'Monitoring threshold exceeded. Sending automated alert...'
+
+                        emailext(
+                            to: "${env.ALERT_EMAIL}",
+                            subject: "RapidCover Monitoring Alert - Jenkins Build #${env.BUILD_NUMBER}",
+                            body: """RapidCover monitoring detected an unhealthy condition.
+
+Job: ${env.JOB_NAME}
+Build: #${env.BUILD_NUMBER}
+Commit: ${env.SHORT_COMMIT}
+
+The production monitoring stage detected a failed health check or system resource threshold.
+
+The monitoring report and server logs are attached.""",
+                            attachmentsPattern: 'monitoring-report.json,monitoring-server.log,monitoring-server-error.log'
+                        )
+
+                        error('Monitoring alert triggered because a health or resource threshold was exceeded.')
+                    }
+
+                    echo 'Production monitoring completed with all health and resource thresholds within limits.'
+                }
+            }
+
+            post {
+                always {
+                    archiveArtifacts(
+                        artifacts: 'monitoring-report.json,monitoring-server.log,monitoring-server-error.log',
+                        allowEmptyArchive: true,
+                        fingerprint: true
+                    )
+                }
+            }
+        }
     }
 
     post {
         success {
-            echo 'RapidCover Build, Test, Code Quality, Security, Staging and Release stages completed successfully.'
+            echo 'RapidCover Build, Test, Code Quality, Security, Staging, Release and Monitoring stages completed successfully.'
         }
 
         failure {
-            echo 'Pipeline stopped because a quality gate or pipeline stage failed.'
+            echo 'Pipeline stopped because a quality gate, security check, deployment, release or monitoring stage failed.'
         }
 
         always {
