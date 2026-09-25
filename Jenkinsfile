@@ -1,6 +1,20 @@
 pipeline {
     agent any
 
+    parameters {
+        booleanParam(
+            name: 'SIMULATE_INCIDENT',
+            defaultValue: false,
+            description: 'Simulate a production monitoring incident to test automated alerting'
+        )
+
+        string(
+            name: 'ALERT_EMAIL',
+            defaultValue: '',
+            description: 'Email address for simulated monitoring alerts'
+        )
+    }
+
     options {
         timestamps()
         disableConcurrentBuilds()
@@ -11,9 +25,6 @@ pipeline {
 
         // Limit SonarQube scanner memory usage on this machine
         SONAR_SCANNER_JAVA_OPTS = '-Xms128m -Xmx512m'
-
-        // Monitoring alert destination
-        ALERT_EMAIL = 'mikekaranja000@gmail.com'
     }
 
     stages {
@@ -108,17 +119,164 @@ pipeline {
 
         stage('Deploy to Staging') {
             steps {
-                echo 'Deploying RapidCover to temporary staging environment on port 3100...'
+                echo 'Deploying and validating RapidCover in staging...'
 
-                bat '''
-                    powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:PORT='3100'; $env:NODE_ENV='staging'; $p = Start-Process -FilePath 'node' -ArgumentList 'src/server.js' -PassThru -RedirectStandardOutput 'staging-server.log' -RedirectStandardError 'staging-server-error.log'; try { Start-Sleep -Seconds 3; $response = Invoke-RestMethod -Uri 'http://127.0.0.1:3100/health' -Method Get; $response | ConvertTo-Json | Set-Content -Path 'staging-health.json'; if ($response.status -ne 'ok') { throw 'Staging health check did not return status ok.' }; Write-Host 'Staging health check passed.' } finally { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force } }"
-                '''
+                /*
+                 * Node-based health checker.
+                 * This replaces the PowerShell scripts that Avast was blocking.
+                 */
+                writeFile file: 'ci-health-check.js', text: '''
+const fs = require('fs');
+const http = require('http');
+
+const environmentName = process.env.CHECK_ENV || 'staging';
+const checkMode = process.env.CHECK_MODE || 'deployment';
+const port = Number(process.env.CHECK_PORT || 3100);
+const outputFile = process.env.CHECK_OUTPUT || 'health-check.json';
+const simulateIncident =
+    String(process.env.SIMULATE_INCIDENT).toLowerCase() === 'true';
+
+process.env.NODE_ENV = environmentName;
+
+const app = require('./src/app');
+
+let completed = false;
+
+const server = app.listen(port, '127.0.0.1', () => {
+    console.log(
+        `RapidCover ${environmentName} validation running on port ${port}`
+    );
+
+    const request = http.get(
+        {
+            hostname: '127.0.0.1',
+            port: port,
+            path: '/health',
+            timeout: 5000
+        },
+        response => {
+            let body = '';
+
+            response.on('data', chunk => {
+                body += chunk;
+            });
+
+            response.on('end', () => {
+                try {
+                    const health = JSON.parse(body);
+
+                    if (simulateIncident) {
+                        finish(1, {
+                            status: 'incident',
+                            environment: environmentName,
+                            mode: checkMode,
+                            port: port,
+                            message:
+                                'Simulated incident detected by automated monitoring.',
+                            healthResponse: health,
+                            checkedAt: new Date().toISOString()
+                        });
+
+                        return;
+                    }
+
+                    if (health.status !== 'ok') {
+                        throw new Error(
+                            'Health endpoint did not return status ok.'
+                        );
+                    }
+
+                    finish(0, {
+                        status: 'ok',
+                        environment: environmentName,
+                        mode: checkMode,
+                        port: port,
+                        healthResponse: health,
+                        checkedAt: new Date().toISOString()
+                    });
+                } catch (error) {
+                    finish(1, {
+                        status: 'failed',
+                        environment: environmentName,
+                        mode: checkMode,
+                        port: port,
+                        message: error.message,
+                        checkedAt: new Date().toISOString()
+                    });
+                }
+            });
+        }
+    );
+
+    request.on('timeout', () => {
+        request.destroy(
+            new Error('Health check request timed out.')
+        );
+    });
+
+    request.on('error', error => {
+        finish(1, {
+            status: 'failed',
+            environment: environmentName,
+            mode: checkMode,
+            port: port,
+            message: error.message,
+            checkedAt: new Date().toISOString()
+        });
+    });
+});
+
+const guardTimer = setTimeout(() => {
+    finish(1, {
+        status: 'timeout',
+        environment: environmentName,
+        mode: checkMode,
+        port: port,
+        message: 'Environment validation timed out.',
+        checkedAt: new Date().toISOString()
+    });
+}, 12000);
+
+function finish(exitCode, report) {
+    if (completed) {
+        return;
+    }
+
+    completed = true;
+    clearTimeout(guardTimer);
+
+    fs.writeFileSync(
+        outputFile,
+        JSON.stringify(report, null, 2)
+    );
+
+    console.log(JSON.stringify(report, null, 2));
+
+    server.close(() => {
+        process.exit(exitCode);
+    });
+
+    setTimeout(() => {
+        process.exit(exitCode);
+    }, 1000).unref();
+}
+'''
+
+                withEnv([
+                    'CHECK_ENV=staging',
+                    'CHECK_MODE=staging-deployment',
+                    'CHECK_PORT=3100',
+                    'CHECK_OUTPUT=staging-health.json',
+                    'SIMULATE_INCIDENT=false'
+                ]) {
+                    bat 'node ci-health-check.js'
+                }
             }
 
             post {
                 always {
                     archiveArtifacts(
-                        artifacts: 'staging-health.json,staging-server.log,staging-server-error.log',
+                        artifacts: 'staging-health.json',
                         allowEmptyArchive: true
                     )
                 }
@@ -149,17 +307,36 @@ pipeline {
                     git tag -f "%RELEASE_TAG%" HEAD
                 '''
 
-                echo 'Starting production validation environment on port 3200...'
+                echo 'Validating production environment...'
 
-                bat '''
-                    powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:PORT='3200'; $env:NODE_ENV='production'; $p = Start-Process -FilePath 'node' -ArgumentList 'src/server.js' -PassThru -RedirectStandardOutput 'production-server.log' -RedirectStandardError 'production-server-error.log'; try { Start-Sleep -Seconds 3; $response = Invoke-RestMethod -Uri 'http://127.0.0.1:3200/health' -Method Get; $response | ConvertTo-Json | Set-Content -Path 'production-health.json'; if ($response.status -ne 'ok') { throw 'Production health check did not return status ok.' }; $manifest = [ordered]@{ releaseTag='%RELEASE_TAG%'; buildNumber='%BUILD_NUMBER%'; commit='%SHORT_COMMIT%'; environment='production'; artifact='%RELEASE_ARTIFACT%'; healthStatus=$response.status; releasedAt=(Get-Date).ToString('o') }; $manifest | ConvertTo-Json | Set-Content -Path 'release-manifest.json'; Write-Host 'Production release %RELEASE_TAG% passed health check.' } finally { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force } }"
-                '''
+                withEnv([
+                    'CHECK_ENV=production',
+                    'CHECK_MODE=production-release',
+                    'CHECK_PORT=3200',
+                    'CHECK_OUTPUT=production-health.json',
+                    'SIMULATE_INCIDENT=false'
+                ]) {
+                    bat 'node ci-health-check.js'
+                }
+
+                writeFile(
+                    file: 'release-manifest.json',
+                    text: """{
+    "releaseTag": "${env.RELEASE_TAG}",
+    "buildNumber": "${env.BUILD_NUMBER}",
+    "commit": "${env.SHORT_COMMIT}",
+    "environment": "production",
+    "artifact": "${env.RELEASE_ARTIFACT}",
+    "healthStatus": "ok"
+}
+"""
+                )
             }
 
             post {
                 always {
                     archiveArtifacts(
-                        artifacts: 'production-release/*.tgz,production-health.json,release-manifest.json,production-server.log,production-server-error.log',
+                        artifacts: 'production-release/*.tgz,production-health.json,release-manifest.json',
                         allowEmptyArchive: true,
                         fingerprint: true
                     )
@@ -169,200 +346,51 @@ pipeline {
 
         stage('Monitoring & Alerting') {
             steps {
-                echo 'Monitoring RapidCover production health and system metrics...'
+                echo 'Running automated production monitoring check...'
 
-                script {
-
-                    // Write the monitoring logic to a PowerShell script.
-                    // This avoids CMD corrupting special PowerShell characters.
-                    writeFile(
-                        file: 'monitoring.ps1',
-                        text: '''
-$ErrorActionPreference = 'Stop'
-
-$env:PORT = '3300'
-$env:NODE_ENV = 'production'
-
-$p = Start-Process `
-    -FilePath 'node' `
-    -ArgumentList 'src/server.js' `
-    -PassThru `
-    -RedirectStandardOutput 'monitoring-server.log' `
-    -RedirectStandardError 'monitoring-server-error.log'
-
-try {
-
-    Start-Sleep -Seconds 3
-
-    $samples = @()
-
-    1..3 | ForEach-Object {
-
-        $response = Invoke-RestMethod `
-            -Uri 'http://127.0.0.1:3300/health' `
-            -Method Get
-
-        $cpuInfo = Get-CimInstance `
-            Win32_PerfFormattedData_PerfOS_Processor |
-            Where-Object { $_.Name -eq '_Total' } |
-            Select-Object -First 1
-
-        if (-not $cpuInfo) {
-            throw 'Unable to read CPU performance data.'
-        }
-
-        $osInfo = Get-CimInstance Win32_OperatingSystem
-        $appProcess = Get-Process -Id $p.Id
-
-        $cpu = [double]$cpuInfo.PercentProcessorTime
-
-        $freeMemoryMB = [math]::Round(
-            $osInfo.FreePhysicalMemory / 1024,
-            2
-        )
-
-        $appMemoryMB = [math]::Round(
-            $appProcess.WorkingSet64 / 1MB,
-            2
-        )
-
-        $sample = [pscustomobject]@{
-            timestamp         = (Get-Date).ToString('o')
-            health            = $response.status
-            systemCpuPercent  = [math]::Round($cpu, 2)
-            availableMemoryMB = $freeMemoryMB
-            appWorkingSetMB   = $appMemoryMB
-        }
-
-        $samples += $sample
-
-        Write-Host (
-            "Health={0}, CPU={1} percent, AvailableMemory={2} MB, AppMemory={3} MB" -f `
-            $response.status,
-            [math]::Round($cpu, 2),
-            $freeMemoryMB,
-            $appMemoryMB
-        )
-
-        Start-Sleep -Seconds 2
-    }
-
-    $healthAlerts = @(
-        $samples |
-        Where-Object { $_.health -ne 'ok' }
-    ).Count
-
-    $cpuAlerts = @(
-        $samples |
-        Where-Object { $_.systemCpuPercent -gt 95 }
-    ).Count
-
-    $memoryAlerts = @(
-        $samples |
-        Where-Object { $_.availableMemoryMB -lt 250 }
-    ).Count
-
-    if (
-        $healthAlerts -gt 0 -or
-        $cpuAlerts -ge 2 -or
-        $memoryAlerts -ge 2
-    ) {
-        $status = 'ALERT'
-    }
-    else {
-        $status = 'HEALTHY'
-    }
-
-    $report = [ordered]@{
-        application = 'RapidCover'
-        environment = 'production-monitoring'
-        buildNumber = $env:BUILD_NUMBER
-        commit = $env:SHORT_COMMIT
-        status = $status
-
-        alertRules = [ordered]@{
-            health = 'status must equal ok'
-            cpu = 'more than 95 percent for at least two samples'
-            availableMemory = 'below 250 MB for at least two samples'
-        }
-
-        samples = $samples
-        generatedAt = (Get-Date).ToString('o')
-    }
-
-    $report |
-        ConvertTo-Json -Depth 6 |
-        Set-Content -Path 'monitoring-report.json'
-
-    Write-Host "Monitoring result: $status"
-
-    if ($status -eq 'ALERT') {
-        exit 2
-    }
-
-    exit 0
-}
-catch {
-
-    Write-Error "Monitoring script failed: $($_.Exception.Message)"
-    exit 1
-}
-finally {
-
-    if ($p -and -not $p.HasExited) {
-        Stop-Process -Id $p.Id -Force
-    }
-}
-'''
-                    )
-
-                    def monitoringResult = bat(
-                        returnStatus: true,
-                        script: 'powershell -NoProfile -ExecutionPolicy Bypass -File "monitoring.ps1"'
-                    )
-
-                    if (monitoringResult == 2) {
-
-                        echo 'Monitoring threshold exceeded. Sending automated alert...'
-
-                        emailext(
-                            to: "${env.ALERT_EMAIL}",
-                            subject: "RapidCover Monitoring Alert - Jenkins Build #${env.BUILD_NUMBER}",
-                            body: """RapidCover monitoring detected an unhealthy condition.
-
-Job: ${env.JOB_NAME}
-Build: #${env.BUILD_NUMBER}
-Commit: ${env.SHORT_COMMIT}
-
-The production monitoring stage detected a failed health check or system resource threshold.
-
-The monitoring report and server logs are attached.""",
-                            attachmentsPattern: 'monitoring-report.json,monitoring-server.log,monitoring-server-error.log'
-                        )
-
-                        error(
-                            'Monitoring alert triggered because a health or resource threshold was exceeded.'
-                        )
-                    }
-
-                    if (monitoringResult != 0) {
-
-                        error(
-                            "Monitoring script failed with exit code ${monitoringResult}. This was a monitoring execution error, not a resource alert."
-                        )
-                    }
-
-                    echo 'Production monitoring completed with all health and resource thresholds within limits.'
+                withEnv([
+                    'CHECK_ENV=production',
+                    'CHECK_MODE=production-monitoring',
+                    'CHECK_PORT=3300',
+                    'CHECK_OUTPUT=monitoring-report.json',
+                    "SIMULATE_INCIDENT=${params.SIMULATE_INCIDENT}"
+                ]) {
+                    bat 'node ci-health-check.js'
                 }
+
+                echo 'Production monitoring check passed.'
             }
 
             post {
                 always {
                     archiveArtifacts(
-                        artifacts: 'monitoring-report.json,monitoring-server.log,monitoring-server-error.log',
-                        allowEmptyArchive: true,
-                        fingerprint: true
+                        artifacts: 'monitoring-report.json',
+                        allowEmptyArchive: true
                     )
+                }
+
+                failure {
+                    script {
+                        echo 'ALERT: RapidCover production monitoring detected an incident.'
+
+                        if (params.ALERT_EMAIL?.trim()) {
+                            emailext(
+                                to: params.ALERT_EMAIL.trim(),
+                                subject: "RapidCover Production Alert - Build #${env.BUILD_NUMBER}",
+                                body: """RapidCover automated monitoring detected a production incident.
+
+Jenkins Build: #${env.BUILD_NUMBER}
+Release: ${env.RELEASE_TAG}
+Commit: ${env.SHORT_COMMIT}
+
+The monitoring report is attached.
+""",
+                                attachmentsPattern: 'monitoring-report.json'
+                            )
+                        } else {
+                            echo 'ALERT_EMAIL is blank, so no email notification was sent.'
+                        }
+                    }
                 }
             }
         }
@@ -370,11 +398,12 @@ The monitoring report and server logs are attached.""",
 
     post {
         success {
-            echo 'RapidCover Build, Test, Code Quality, Security, Staging, Release and Monitoring stages completed successfully.'
+            echo 'RapidCover CI/CD pipeline completed successfully.'
+            echo 'Build, Test, Code Quality, Security, Staging, Production Release and Monitoring all passed.'
         }
 
         failure {
-            echo 'Pipeline stopped because a quality gate, security check, deployment, release or monitoring stage failed.'
+            echo 'Pipeline stopped because a quality gate, deployment check or monitoring check failed.'
         }
 
         always {
