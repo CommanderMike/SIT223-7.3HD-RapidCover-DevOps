@@ -173,14 +173,155 @@ pipeline {
 
                 script {
 
-                    def monitoringResult = bat(
-                        returnStatus: true,
-                        script: '''
-                            powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $env:PORT='3300'; $env:NODE_ENV='production'; $p = Start-Process -FilePath 'node' -ArgumentList 'src/server.js' -PassThru -RedirectStandardOutput 'monitoring-server.log' -RedirectStandardError 'monitoring-server-error.log'; try { Start-Sleep -Seconds 3; $samples = @(); 1..3 | ForEach-Object { $response = Invoke-RestMethod -Uri 'http://127.0.0.1:3300/health' -Method Get; $cpuInfo = Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter \\"Name='_Total'\\"; $osInfo = Get-CimInstance Win32_OperatingSystem; $appProcess = Get-Process -Id $p.Id; $cpu = [double]$cpuInfo.PercentProcessorTime; $freeMemoryMB = [math]::Round($osInfo.FreePhysicalMemory / 1024, 2); $appMemoryMB = [math]::Round($appProcess.WorkingSet64 / 1MB, 2); $samples += [pscustomobject]@{ timestamp=(Get-Date).ToString('o'); health=$response.status; systemCpuPercent=[math]::Round($cpu,2); availableMemoryMB=$freeMemoryMB; appWorkingSetMB=$appMemoryMB }; Write-Host \\"Health=$($response.status), CPU=$([math]::Round($cpu,2))%, AvailableMemory=$freeMemoryMB MB, AppMemory=$appMemoryMB MB\\"; Start-Sleep -Seconds 2 }; $healthAlerts = @($samples | Where-Object { $_.health -ne 'ok' }).Count; $cpuAlerts = @($samples | Where-Object { $_.systemCpuPercent -gt 95 }).Count; $memoryAlerts = @($samples | Where-Object { $_.availableMemoryMB -lt 250 }).Count; if ($healthAlerts -gt 0 -or $cpuAlerts -ge 2 -or $memoryAlerts -ge 2) { $status='ALERT' } else { $status='HEALTHY' }; $report = [ordered]@{ application='RapidCover'; environment='production-monitoring'; buildNumber=$env:BUILD_NUMBER; commit=$env:SHORT_COMMIT; status=$status; alertRules=[ordered]@{ health='status must equal ok'; cpu='more than 95 percent for at least two samples'; availableMemory='below 250 MB for at least two samples' }; samples=$samples; generatedAt=(Get-Date).ToString('o') }; $report | ConvertTo-Json -Depth 6 | Set-Content -Path 'monitoring-report.json'; Write-Host \\"Monitoring result: $status\\"; if ($status -eq 'ALERT') { exit 2 } } finally { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force } }"
-                        '''
+                    // Write the monitoring logic to a PowerShell script.
+                    // This avoids CMD corrupting special PowerShell characters.
+                    writeFile(
+                        file: 'monitoring.ps1',
+                        text: '''
+$ErrorActionPreference = 'Stop'
+
+$env:PORT = '3300'
+$env:NODE_ENV = 'production'
+
+$p = Start-Process `
+    -FilePath 'node' `
+    -ArgumentList 'src/server.js' `
+    -PassThru `
+    -RedirectStandardOutput 'monitoring-server.log' `
+    -RedirectStandardError 'monitoring-server-error.log'
+
+try {
+
+    Start-Sleep -Seconds 3
+
+    $samples = @()
+
+    1..3 | ForEach-Object {
+
+        $response = Invoke-RestMethod `
+            -Uri 'http://127.0.0.1:3300/health' `
+            -Method Get
+
+        $cpuInfo = Get-CimInstance `
+            Win32_PerfFormattedData_PerfOS_Processor |
+            Where-Object { $_.Name -eq '_Total' } |
+            Select-Object -First 1
+
+        if (-not $cpuInfo) {
+            throw 'Unable to read CPU performance data.'
+        }
+
+        $osInfo = Get-CimInstance Win32_OperatingSystem
+        $appProcess = Get-Process -Id $p.Id
+
+        $cpu = [double]$cpuInfo.PercentProcessorTime
+
+        $freeMemoryMB = [math]::Round(
+            $osInfo.FreePhysicalMemory / 1024,
+            2
+        )
+
+        $appMemoryMB = [math]::Round(
+            $appProcess.WorkingSet64 / 1MB,
+            2
+        )
+
+        $sample = [pscustomobject]@{
+            timestamp         = (Get-Date).ToString('o')
+            health            = $response.status
+            systemCpuPercent  = [math]::Round($cpu, 2)
+            availableMemoryMB = $freeMemoryMB
+            appWorkingSetMB   = $appMemoryMB
+        }
+
+        $samples += $sample
+
+        Write-Host (
+            "Health={0}, CPU={1} percent, AvailableMemory={2} MB, AppMemory={3} MB" -f `
+            $response.status,
+            [math]::Round($cpu, 2),
+            $freeMemoryMB,
+            $appMemoryMB
+        )
+
+        Start-Sleep -Seconds 2
+    }
+
+    $healthAlerts = @(
+        $samples |
+        Where-Object { $_.health -ne 'ok' }
+    ).Count
+
+    $cpuAlerts = @(
+        $samples |
+        Where-Object { $_.systemCpuPercent -gt 95 }
+    ).Count
+
+    $memoryAlerts = @(
+        $samples |
+        Where-Object { $_.availableMemoryMB -lt 250 }
+    ).Count
+
+    if (
+        $healthAlerts -gt 0 -or
+        $cpuAlerts -ge 2 -or
+        $memoryAlerts -ge 2
+    ) {
+        $status = 'ALERT'
+    }
+    else {
+        $status = 'HEALTHY'
+    }
+
+    $report = [ordered]@{
+        application = 'RapidCover'
+        environment = 'production-monitoring'
+        buildNumber = $env:BUILD_NUMBER
+        commit = $env:SHORT_COMMIT
+        status = $status
+
+        alertRules = [ordered]@{
+            health = 'status must equal ok'
+            cpu = 'more than 95 percent for at least two samples'
+            availableMemory = 'below 250 MB for at least two samples'
+        }
+
+        samples = $samples
+        generatedAt = (Get-Date).ToString('o')
+    }
+
+    $report |
+        ConvertTo-Json -Depth 6 |
+        Set-Content -Path 'monitoring-report.json'
+
+    Write-Host "Monitoring result: $status"
+
+    if ($status -eq 'ALERT') {
+        exit 2
+    }
+
+    exit 0
+}
+catch {
+
+    Write-Error "Monitoring script failed: $($_.Exception.Message)"
+    exit 1
+}
+finally {
+
+    if ($p -and -not $p.HasExited) {
+        Stop-Process -Id $p.Id -Force
+    }
+}
+'''
                     )
 
-                    if (monitoringResult != 0) {
+                    def monitoringResult = bat(
+                        returnStatus: true,
+                        script: 'powershell -NoProfile -ExecutionPolicy Bypass -File "monitoring.ps1"'
+                    )
+
+                    if (monitoringResult == 2) {
 
                         echo 'Monitoring threshold exceeded. Sending automated alert...'
 
@@ -199,7 +340,16 @@ The monitoring report and server logs are attached.""",
                             attachmentsPattern: 'monitoring-report.json,monitoring-server.log,monitoring-server-error.log'
                         )
 
-                        error('Monitoring alert triggered because a health or resource threshold was exceeded.')
+                        error(
+                            'Monitoring alert triggered because a health or resource threshold was exceeded.'
+                        )
+                    }
+
+                    if (monitoringResult != 0) {
+
+                        error(
+                            "Monitoring script failed with exit code ${monitoringResult}. This was a monitoring execution error, not a resource alert."
+                        )
                     }
 
                     echo 'Production monitoring completed with all health and resource thresholds within limits.'
