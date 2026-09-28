@@ -30,3 +30,5 @@ Run tests with coverage:
 npm run test:coverage
 
 The project currently uses automated coverage thresholds to prevent insufficiently tested code from passing the testing stage.
+
+Supporting evidence: [RapidCover-HD-Evidence.pdf](RapidCover-HD-Evidence.pdf)
